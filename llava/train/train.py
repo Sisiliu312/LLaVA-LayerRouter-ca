@@ -37,6 +37,7 @@ from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
+import torch.nn as nn
 
 
 local_rank = None
@@ -110,8 +111,6 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
-    ca_lr: Optional[float] = field(default=None)
-    # ca_warmup_steps: int = field(default=100)
     group_by_modality_length: bool = field(default=False)
 
 
@@ -741,13 +740,6 @@ class LazySupervisedDataset(Dataset):
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
         return data_dict
 
-# class LrMonitorCallback(TrainerCallback):
-#     def on_step_begin(self, args, state, control, **kwargs):
-#         optimizer = kwargs['optimizer']
-#         for i, param_group in enumerate(optimizer.param_groups):
-#             if 'ca.' in str(param_group['params'][0]):
-#                 print(f"Step {state.global_step}: CA LR = {param_group['lr']:.3e}")
-
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
@@ -793,17 +785,48 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator)
 
-# def register_gradient_hooks(model):
-#     def hook_fn(grad, name):
-#         if grad is not None:
-#             print(f"[Gradient Hook] {name} grad norm: {grad.norm():.4f}")
-#         else:
-#             print(f"[Gradient Hook] {name} grad is None!")
-#     if hasattr(model, "module"):
-#         model = model.module
-#     for name, param in model.named_parameters():
-#         if param.requires_grad and ("ca" in name or "mm_projector" in name):
-#             param.register_hook(lambda grad, n=name: hook_fn(grad, n))
+def register_gradient_hooks(model):
+    """为不同模块设置不同的梯度放大系数"""
+    
+    print("\n🚀 注册梯度放大 Hooks")
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        if 'layer_router' in name:
+            # Router 梯度放大 1000x
+            def make_hook(pname):
+                def hook_fn(grad):
+                    if grad is not None:
+                        scaled = grad * 1000.0
+                        print(f"[Router] {pname}: {grad.norm():.6e} → {scaled.norm():.3e} (1000x)")
+                        return scaled
+                    return grad
+                return hook_fn
+            param.register_hook(make_hook(name))
+            
+        elif 'ca.' in name or 'W_q' in name or 'W_k' in name:
+            # CA 梯度放大 10x
+            def make_hook(pname):
+                def hook_fn(grad):
+                    if grad is not None:
+                        scaled = grad * 10.0
+                        print(f"[CA] {pname}: {grad.norm():.6e} → {scaled.norm():.4e} (10x)")
+                        return scaled
+                    return grad
+                return hook_fn
+            param.register_hook(make_hook(name))
+            
+        elif 'mm_projector' in name:
+            # Projector 不放大
+            def make_hook(pname):
+                def hook_fn(grad):
+                    if grad is not None:
+                        print(f"[Proj] {pname}: {grad.norm():.4f} (1x)")
+                    return grad
+                return hook_fn
+            param.register_hook(make_hook(name))
 
 def train(attn_implementation=None):
     global local_rank
@@ -844,7 +867,6 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
         else:
-            # print("-=-=-=-=-=-=-=-=-=-=-=-=-=-")
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
@@ -863,6 +885,62 @@ def train(attn_implementation=None):
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
+
+    def fix_ca_after_loading(model):
+        """
+        在训练脚本中调用此函数，加载模型后立即修复
+        
+        使用方法：
+        model = LlavaLlamaForCausalLM.from_pretrained(...)
+        fix_ca_after_loading(model)  # ⭐ 添加这行
+        """
+        if hasattr(model, 'model') and hasattr(model.model, 'ca'):
+            cross_att = model.model.ca
+            with torch.no_grad():
+                nn.init.xavier_uniform_(cross_att.W_q.weight)
+                nn.init.xavier_uniform_(cross_att.W_k.weight)
+                nn.init.constant_(cross_att.W_q.bias, 0.0)
+                nn.init.constant_(cross_att.W_k.bias, 0.0)    
+                
+            print(f"✅ ca bias after fix")
+
+    fix_ca_after_loading(model)
+    
+
+    def fix_router_after_loading(model):
+        """
+        在训练脚本中调用此函数，加载模型后立即修复
+        
+        使用方法：
+        model = LlavaLlamaForCausalLM.from_pretrained(...)
+        fix_router_after_loading(model)  # ⭐ 添加这行
+        """
+        if hasattr(model, 'model') and hasattr(model.model, 'layer_router'):
+            router = model.model.layer_router
+            current_bias_std = router.w3.bias.std().item()
+            
+            print(f"🔍 Checking router bias std: {current_bias_std:.4f}")
+            
+            if current_bias_std < 0.5:  # 太小，说明被重置了
+                print("🔧 Re-initializing router bias...")
+                with torch.no_grad():
+                    uniform_indices = [3,8,13,18,23]
+                    router.w3.bias.fill_(-0.1)
+                    for idx in uniform_indices:
+                        router.w3.bias[idx] = 0.1
+                    
+                    nn.init.xavier_uniform_(router.w1.weight)
+                    nn.init.xavier_uniform_(router.w2.weight)
+                    nn.init.xavier_uniform_(router.w3.weight)
+                    nn.init.constant_(router.w1.bias, 0.0)
+                    nn.init.constant_(router.w2.bias, 0.0)
+                
+                print(f"✅ Router bias after fix: {router.w3.bias[:6].tolist()}")
+                print(f"   Top-5 bias indices: {torch.topk(router.w3.bias, 5).indices.tolist()}")
+            else:
+                print("✅ Router bias looks good, no fix needed")
+
+    fix_router_after_loading(model)
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -956,6 +1034,10 @@ def train(attn_implementation=None):
 
             for p in model.get_model().ca.parameters():
                 p.requires_grad = True
+
+            for name, p in model.get_model().layer_router.named_parameters():
+                p.requires_grad = True
+                print(f"  ✅ {name}: requires_grad=True")
             
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
@@ -987,33 +1069,23 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    
 
-    # for name, param in model.named_parameters():
-    #     print(f"{name} 的梯度：", param.grad)
-    #     print(f"{name} 的需要修改：", param.requires_grad)
-    
-
-    # for name, param in model.named_parameters():
-        # print(f"{name} 的梯度：", param.requires_grad)
-
-    # assert any("W_k" in n for n, _ in model.named_parameters()), \
-    #    "New parameter not found!"
+    for name, param in model.named_parameters():
+        print(f"{name} 的梯度：", param.grad)
+        print(f"{name} 的需要修改：", param.requires_grad)
 
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+    register_gradient_hooks(model)
     
-    # trainer.add_callback(LrMonitorCallback())
-    # register_gradient_hooks(model)
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
 
-    # trainer.add_callback(LrMonitorCallback())
-    # register_gradient_hooks(model)
     trainer.save_state()
 
     model.config.use_cache = True

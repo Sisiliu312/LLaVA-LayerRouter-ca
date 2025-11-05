@@ -31,55 +31,6 @@ class SimpleResBlock(nn.Module):
     def forward(self, x):
         x = self.pre_norm(x)
         return x + self.proj(x)
-    
-# class CrossAttention(nn.Module):
-#     def __init__(self, text_dim=4096, feature_dim=4096):
-#         super(CrossAttention, self).__init__()
-#         self.W_q = nn.Linear(text_dim, feature_dim)
-#         self.W_k = nn.Linear(feature_dim, feature_dim)
-
-#     def forward(self, text, features):
-#         # print("Text input scale:", text.min(), text.max())  
-#         # print("Image input scale:", features.min(), features.max())  
-#         # text: [batch, text_seq_len, text_dim] 文本特征
-#         # features: [batch, num_patches, feature_dim] 图像特征
-        
-#         # 计算查询向量Q和键向量K
-#         Q = self.W_q(text)  # [batch, text_seq_len, feature_dim]
-#         K = self.W_k(features)  # [batch, num_patches, feature_dim]
-#         # Q = Q / (Q.norm(dim=-1, keepdim=True) + 1e-6)
-#         # K = K / (K.norm(dim=-1, keepdim=True) + 1e-6)
-
-#         # print("-------------------q:", self.W_q.weight.data)
-#         # print("*******************k:", self.W_k.weight.data)
-
-#         # print("-------------------Q:", Q.data)
-#         # print("*******************K:", K.data)
-        
-
-#         # print("Q max/min:", Q.max(), Q.min())  
-#         # print("K max/min:", K.max(), K.min()) 
-#         # 计算注意力分数
-#         attn_scores = torch.matmul(Q, K.transpose(1, 2))
-#         attn_scores = attn_scores / (K.size(-1) ** 0.5)
-#         # print("^^^^^^^^^^^^^^^^^^^^^^^attn_scores为:",attn_scores)
-#         attn_weights = torch.softmax(attn_scores, dim=-1)
-#         # print("^^^^^^^^^^^^^^^^^^^^^^^attn_weights为:",attn_weights)
-        
-#         # 在text_seq_len维度上取平均，得到每块的注意力权重
-#         attn_weights = attn_weights.mean(dim=1)  # [batch, num_patches]
-        
-#         return attn_weights
-class SafeLayerNorm(nn.LayerNorm):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        return F.layer_norm(
-            x.to(torch.float32),  # 先转换为 float32
-            self.normalized_shape,
-            self.weight.to(torch.float32) if self.weight is not None else None,
-            self.bias.to(torch.float32) if self.bias is not None else None,
-            self.eps
-        ).to(orig_dtype)  # 再转回原始 dtype
 
 class AttentionWeightSaver:
     def __init__(self, save_dir='attention_weights', format='pt'):
@@ -136,30 +87,17 @@ class AttentionWeightSaver:
 saver = AttentionWeightSaver(save_dir='/home/data/shika/LLaVA/playground/data/eval/textvqa', format='pt')
 
 class CrossAttention(nn.Module):
-    def __init__(self, text_dim=4096, feature_dim=4096):
+    def __init__(self, text_dim, feature_dim):
         super(CrossAttention, self).__init__()
         # 初始化线性变换层
+        self.text_dim = text_dim
+        self.feature_dim = feature_dim
         self.W_q = nn.Linear(text_dim, feature_dim)
         self.W_k = nn.Linear(feature_dim, feature_dim)
-        
-        # 添加LayerNorm归一化层
-        # self.q_norm = SafeLayerNorm(feature_dim, eps=1e-6)
-        # self.k_norm = SafeLayerNorm(feature_dim, eps=1e-6)
-        # self.q_norm = nn.LayerNorm(feature_dim, eps=1e-6)
-        # self.k_norm = nn.LayerNorm(feature_dim, eps=1e-6)
         
         # 初始化参数
         self._reset_parameters()
 
-    # def _reset_parameters(self):
-    #     # 对线性层使用 Kaiming 初始化（更激进）
-    #     for p in [self.W_q.weight, self.W_k.weight]:
-    #         if p.dim() > 1:
-    #             nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-    #     # 偏置初始化为 0
-    #     for p in [self.W_q.bias, self.W_k.bias]:
-    #         if p is not None:
-    #             nn.init.constant_(p, 0.0)
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.W_q.weight)
         nn.init.xavier_uniform_(self.W_k.weight)
@@ -208,7 +146,88 @@ class CrossAttention(nn.Module):
         attended = torch.matmul(attn_weights, features)  # [B, T, D]
 
         return attended
+
+class LayerSelectionRouter(nn.Module):
+    """
+    Router that selects top-5 layers from 24 vision tower layers.
+    Initialized to uniformly select layers [1, 6, 11, 16, 21] (0-indexed: [0, 5, 10, 15, 20])
+    """
+    def __init__(self, dim, num_layers, top_k):
+        super().__init__()
+        self.num_layers = num_layers
+        self.top_k = 5
+        self.dim = dim
+
+        print(f"Initializing LayerSelectionRouter with dim={self.dim}, num_layers={self.num_layers}, top_k={self.top_k}")
         
+        # Router network with SiLU gating (matching diagram: W1, W2, W3)
+        self.w1 = nn.Linear(dim, dim)
+        self.w2 = nn.Linear(dim, dim)
+        self.w3 = nn.Linear(dim, num_layers)
+        
+        # Initialize to favor uniform selection of [0, 5, 10, 15, 20]
+        self._initialize_uniform_selection()
+        print("初始化后 w3.bias (前6 + 后1):", self.w3.bias.tolist()[:6] + ["..."] + [self.w3.bias.tolist()[-1]])
+        
+    def _initialize_uniform_selection(self):
+        """Initialize router to uniformly select layers [1, 6, 11, 16, 21] (0-indexed)"""
+        with torch.no_grad():
+            # Target layer indices (0-indexed for [1, 6, 11, 16, 21])
+            uniform_indices = [0, 5, 10, 15, 20]
+            
+            # Initialize W3 bias with large negative values
+            self.w3.bias.fill_(-10.0)
+            
+            # Set positive bias for desired layers
+            for idx in uniform_indices:
+                self.w3.bias[idx] = 10.0
+            
+            # Initialize weights to small values for stability
+            nn.init.xavier_uniform_(self.w1.weight)
+            nn.init.xavier_uniform_(self.w2.weight)
+            nn.init.xavier_uniform_(self.w3.weight)
+            nn.init.constant_(self.w1.bias, 0.0)
+            nn.init.constant_(self.w2.bias, 0.0)
+    
+    def forward(self, text_features):
+        """
+        Args:
+            text_features: Text token features [batch_size, text_len, dim]
+        
+        Returns:
+            layer_weights: Softmax weights for all layers [batch_size, num_layers]
+            selected_indices: Indices of top-k selected layers [batch_size, top_k]
+        """
+        # Average pool over sequence length to get representation
+        # [batch_size, text_len, dim] -> [batch_size, dim]
+        pooled = text_features.mean(dim=1)
+        # self.attention_pool = nn.Sequential(
+        #     nn.Linear(dim, 1),
+        #     nn.Softmax(dim=1)
+        # )
+        
+        # Apply gating mechanism (matching diagram architecture)
+        # W1 with SiLU
+        h1 = F.silu(self.w1(pooled))
+        
+        # W2 with SiLU  
+        h2 = F.silu(self.w2(pooled))
+        
+        # Element-wise multiplication (circle with dot in diagram)
+        gated = h1 * h2
+        
+        print("forward 前 w3.bias (前6 + 后1):", self.w3.bias.tolist()[:6] + ["..."] + [self.w3.bias.tolist()[-1]])
+        # W3 to get layer logits
+        logits = self.w3(gated)  # [batch_size, num_layers]
+        
+        # Apply softmax to get layer selection probabilities
+        layer_probs = F.softmax(logits, dim=-1)
+
+        # Select top-k layers
+        top_weights, top_indices = torch.topk(layer_probs, self.top_k, dim=-1)
+        top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
+        
+        return top_indices, top_weights, layer_probs
 
 def build_vision_projector(config, delay_load=False, **kwargs):
     projector_type = getattr(config, 'mm_projector_type', 'linear')
@@ -230,5 +249,18 @@ def build_vision_projector(config, delay_load=False, **kwargs):
 
     raise ValueError(f'Unknown projector type: {projector_type}')
 
-def build_cross_attn():
-    return CrossAttention()
+def build_cross_attn(config):
+    text_dim = config.text_dim if hasattr(config, 'text_dim') else 4096
+    feature_dim = config.feature_dim if hasattr(config, 'feature_dim') else 4096
+    
+    return CrossAttention(text_dim=text_dim, feature_dim=feature_dim)
+
+def build_layer_router(config):
+    dim = config.dim if hasattr(config, 'dim') else 4096
+    num_layers = config.num_layers if hasattr(config, 'num_layers') else 24
+    top_k = config.top_k if hasattr(config, 'top_k') else 5
+    if hasattr(config, 'top_k'):
+        print(f"Building LayerSelectionRouter with top_k={config.top_k}")
+    
+    
+    return LayerSelectionRouter(dim=dim, num_layers=num_layers, top_k=top_k)

@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder import build_vision_projector, build_cross_attn
+from .multimodal_projector.builder import build_vision_projector, build_cross_attn, build_layer_router
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
@@ -31,7 +31,8 @@ class LlavaMetaModel:
 
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
-        self.ca = build_cross_attn()
+        self.ca = build_cross_attn(config)
+        self.layer_router = build_layer_router(config)
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
@@ -49,6 +50,9 @@ class LlavaMetaModel:
     
     def get_cross_attn(self):
         return self.ca
+    
+    def get_layer_router(self):
+        return self.layer_router
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -58,12 +62,6 @@ class LlavaMetaModel:
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
-
-        # print("jfdoajfoidajofjdaojfdosajf")
-        # print(self.ca)
-        # for n, p in self.mm_projector.named_parameters():
-        #     print(n)
-        #     p.requires_grad = True
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
@@ -87,8 +85,13 @@ class LlavaMetaModel:
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
         if getattr(self, 'ca', None) is None:
-            self.ca = build_cross_attn()
+            self.ca = build_cross_attn(self.config)
             for p in self.ca.parameters():
+                p.requires_grad = True
+
+        if getattr(self, 'layer_router', None) is None:
+            self.layer_router = build_layer_router(self.config)
+            for p in self.layer_router.parameters():
                 p.requires_grad = True
 
         if getattr(self, 'mm_projector', None) is None:
@@ -156,8 +159,43 @@ class LlavaMetaForCausalLM(ABC):
     def get_cross_attn(self):
         return self.get_model().get_cross_attn()
 
+    def get_layer_router(self):
+        return self.get_model().get_layer_router()
+
+
+    # def encode_images(self, images, text_token):
+    #     # 获取24层特征
+    #     image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
+
+    #     # 处理text
+    #     combined_text = torch.cat(text_token, dim=0)
+    #     if combined_text.dim() == 2:
+    #         combined_text = combined_text.unsqueeze(0)
+
+    #     # 初始化最终输出
+    #     batch_size, text_len, dim = combined_text.shape
+    #     batch_size = image_features.shape[0]
+    #     combined_features = torch.zeros(batch_size, text_len, dim, device=combined_text.device, dtype=combined_text.dtype)
+    #     # print("image_features shape:",image_features.shape)
+    #     # image_features = dense_connector(image_features, image_forward_outs, text_token)
+    #     for i in [3,8,13,18,23]:
+    #     # 获取当前层特征 [batch, num_patches, dim]
+    #         # layer_feat = image_forward_outs.hidden_states[i]
+    #         # layer_feat = image_forward_outs.hidden_states[i].half()
+    #         layer_feat = image_forward_outs.hidden_states[i][:, 1:].to(image_features.dtype)
+    #         # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
+    #         # print("layer_feat type:", type(layer_feat))
+    #         layer_features = self.get_model().mm_projector(layer_feat)
+    #         attended = self.get_model().ca(combined_text, layer_features)
+    #         combined_features += attended
+    #         # print("layer_feat type:", type(layer_feat))
+    #     return combined_features
 
     def encode_images(self, images, text_token):
+        """
+        Batched version - assumes all samples select the same top-5 layers.
+        More efficient but less flexible.
+        """
         # 获取24层特征
         image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
 
@@ -169,21 +207,44 @@ class LlavaMetaForCausalLM(ABC):
         # 初始化最终输出
         batch_size, text_len, dim = combined_text.shape
         batch_size = image_features.shape[0]
-        combined_features = torch.zeros(batch_size, text_len, dim, device=combined_text.device, dtype=combined_text.dtype)
-        # print("image_features shape:",image_features.shape)
-        # image_features = dense_connector(image_features, image_forward_outs, text_token)
-        for i in [3,8,13,18,23]:
+        combined_features = torch.zeros(
+            batch_size, text_len, dim, 
+            device=combined_text.device, 
+            dtype=combined_text.dtype
+        )
+        
+        # Use router to select top-5 layers
+        # For batched version, use first sample's selection for all
+        top_indices, top_weights, all_probs = self.get_model().layer_router(combined_text)
+        
+        # Use the most common selection or first sample's selection
+        selected_indices = top_indices[0]
+        selected_weights = top_weights[0]
+        print(f"Selected layers: {selected_indices.tolist()}")
+        print(f"Layer weights: {selected_weights.tolist()}")
+        
+        for idx in range(len(selected_indices)):
         # 获取当前层特征 [batch, num_patches, dim]
             # layer_feat = image_forward_outs.hidden_states[i]
             # layer_feat = image_forward_outs.hidden_states[i].half()
-            layer_feat = image_forward_outs.hidden_states[i][:, 1:].to(image_features.dtype)
+            layer_idx = selected_indices[idx].item()  # 转为整数用于索引
+            weight = selected_weights[idx]
+
+            layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
+            # print("layer_feat shape:", layer_feat.shape)
             # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
             # print("layer_feat type:", type(layer_feat))
             layer_features = self.get_model().mm_projector(layer_feat)
+
             attended = self.get_model().ca(combined_text, layer_features)
-            combined_features += attended
+
             # print("layer_feat type:", type(layer_feat))
+            combined_features += weight * attended
+            
+            # print(f"Processed layer {idx}")
+            # print("combined_features shape:", combined_features.shape)
         return combined_features
+
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
