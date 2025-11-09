@@ -31,12 +31,13 @@ class LlavaMetaModel:
 
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
-        # self.ca = build_cross_attn(config)
-        # self.layer_router = build_layer_router(config)
+        
         if hasattr(config, "mm_vision_tower"):
             print("==========================Building vision tower================")
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
+            self.ca = build_cross_attn(config)
+            self.layer_router = build_layer_router(config)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -108,6 +109,7 @@ class LlavaMetaModel:
                 p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
+            
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
 
             def get_w(weights, keyword):
@@ -122,8 +124,6 @@ class LlavaMetaModel:
                 self.layer_router.load_state_dict(get_w(mm_projector_weights, 'layer_router'))
         
         
-
-
 
 def unpad_image(tensor, original_size):
     """
@@ -213,6 +213,8 @@ class LlavaMetaForCausalLM(ABC):
         if combined_text.dim() == 2:
             combined_text = combined_text.unsqueeze(0)
 
+        print("combined_text shape:", combined_text.shape)
+
         # 初始化最终输出
         batch_size, text_len, dim = combined_text.shape
         batch_size = image_features.shape[0]
@@ -227,17 +229,17 @@ class LlavaMetaForCausalLM(ABC):
         top_indices, top_weights, all_probs = self.get_model().layer_router(combined_text)
         
         # Use the most common selection or first sample's selection
-        selected_indices = top_indices[0]
-        selected_weights = top_weights[0]
-        print(f"Selected layers: {selected_indices.tolist()}")
-        print(f"Layer weights: {selected_weights.tolist()}")
+        # selected_indices = top_indices[0]
+        # selected_weights = top_weights[0]
+        print(f"Selected layers: {top_indices.tolist()}")
+        print(f"Layer weights: {top_weights.tolist()}")
         
-        for idx in range(len(selected_indices)):
+        for idx in range(len(top_indices)):
         # 获取当前层特征 [batch, num_patches, dim]
             # layer_feat = image_forward_outs.hidden_states[i]
             # layer_feat = image_forward_outs.hidden_states[i].half()
-            layer_idx = selected_indices[idx].item()  # 转为整数用于索引
-            weight = selected_weights[idx]
+            layer_idx = top_indices[idx].item()  # 转为整数用于索引
+            weight = top_weights[idx]
 
             layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
             # print("layer_feat shape:", layer_feat.shape)

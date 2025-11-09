@@ -799,31 +799,25 @@ def register_gradient_hooks(model):
             def make_hook(pname):
                 def hook_fn(grad):
                     if grad is not None:
-                        scaled = grad * 1000.0
-                        print(f"[Router] {pname}: {grad.norm():.6e} → {scaled.norm():.3e} (1000x)")
-                        return scaled
+                        print(f"[Router] {pname}: {grad.norm():.6f}")
                     return grad
                 return hook_fn
             param.register_hook(make_hook(name))
             
-        elif 'ca.' in name or 'W_q' in name or 'W_k' in name:
-            # CA 梯度放大 10x
+        elif 'ca.' in name:
             def make_hook(pname):
                 def hook_fn(grad):
                     if grad is not None:
-                        scaled = grad * 10.0
-                        print(f"[CA] {pname}: {grad.norm():.6e} → {scaled.norm():.4e} (10x)")
-                        return scaled
+                        print(f"[CA] {pname}: {grad.norm():.6}")
                     return grad
                 return hook_fn
             param.register_hook(make_hook(name))
             
         elif 'mm_projector' in name:
-            # Projector 不放大
             def make_hook(pname):
                 def hook_fn(grad):
                     if grad is not None:
-                        print(f"[Proj] {pname}: {grad.norm():.4f} (1x)")
+                        print(f"[Proj] {pname}: {grad.norm():.4f} ")
                     return grad
                 return hook_fn
             param.register_hook(make_hook(name))
@@ -1030,27 +1024,28 @@ def train(attn_implementation=None):
     # for name, param in model.named_parameters():
     #     print(f"{name} 的梯度：", param.grad)
     #     print(f"{name} 的需要修改：", param.requires_grad)
-    print("=" * 60)
-    print("🔍 训练配置:")
-    print(f"  lora_enable: {training_args.lora_enable}")
-    print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
-    print("=" * 60)
+    # print("=" * 60)
+    # print("🔍 训练配置:")
+    # print(f"  lora_enable: {training_args.lora_enable}")
+    # print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
+    # print("=" * 60)
 
-    # 检查模型结构
-    print("\n🔍 layer_router 结构:")
-    for name, module in model.get_model().layer_router.named_modules():
-        if name:
-            print(f"  {name}: {type(module).__name__}")
+    # # 检查模型结构
+    # print("\n🔍 layer_router 结构:")
+    # for name, module in model.get_model().layer_router.named_modules():
+    #     if name:
+    #         print(f"  {name}: {type(module).__name__}")
 
-    print("\n🔍 ca 结构:")
-    for name, module in model.get_model().ca.named_modules():
-        if name:
-            print(f"  {name}: {type(module).__name__}")
+    # print("\n🔍 ca 结构:")
+    # for name, module in model.get_model().ca.named_modules():
+    #     if name:
+    #         print(f"  {name}: {type(module).__name__}")
 
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+    
 
     register_gradient_hooks(model)
     

@@ -7,8 +7,8 @@ deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path /hy-tmp/vicuna-7b-v1.5 \
     --version plain \
-    --data_path /hy-tmp/TextVQA/pretrain.json \
-    --image_folder /hy-tmp/TextVQA/train_images \
+    --data_path /hy-tmp/Train/pretrain.json \
+    --image_folder /hy-tmp/Train/images \
     --vision_tower /hy-tmp/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter True \
@@ -18,9 +18,9 @@ deepspeed llava/train/train_mem.py \
     --bf16 True \
     --output_dir /hy-tmp/checkpoints/llava-v1.5-7b-pretrain \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 32 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 32 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 24000 \
@@ -43,8 +43,8 @@ deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path /hy-tmp/vicuna-7b-v1.5 \
     --version v1 \
-    --data_path /hy-tmp/TextVQA/finetune.json \
-    --image_folder /hy-tmp/TextVQA/train_images \
+    --data_path /hy-tmp/Train/finetune.json \
+    --image_folder /hy-tmp/Train/images \
     --vision_tower /hy-tmp/clip-vit-large-patch14-336 \
     --pretrain_mm_mlp_adapter /hy-tmp/checkpoints/llava-v1.5-7b-pretrain/mm_projector.bin \
     --mm_projector_type mlp2x_gelu \
@@ -56,9 +56,9 @@ deepspeed llava/train/train_mem.py \
     --bf16 True \
     --output_dir /hy-tmp/checkpoints/llava-v1.5-7b-lora \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 16 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 50000 \
@@ -76,12 +76,12 @@ deepspeed llava/train/train_mem.py \
     --report_to wandb \
     --run_name finetune
 
-# python ./scripts/merge_lora_weights.py \
-#     --model-path ./checkpoints/cat/llava-v1.5-7b-pretrain \
-#     --model-base /home/data/shika/models/lmsys/vicuna-7b-v1.5 \
-#     --save-model-path ./checkpoints/cat/llava-v1.5-7b-pretrain-full
+python ./scripts/merge_lora_weights.py \
+    --model-path /hy-tmp/checkpoints/llava-v1.5-7b-pretrain \
+    --model-base /hy-tmp/vicuna-7b-v1.5 \
+    --save-model-path /hy-tmp/checkpoints/llava-v1.5-7b-pretrain-full
 
-# python ./scripts/merge_lora_weights.py \
-#     --model-path ./checkpoints/cat/llava-v1.5-7b-lora \
-#     --model-base ./checkpoints/cat/llava-v1.5-7b-pretrain-full \
-#     --save-model-path ./checkpoints/cat/llava-v1.5-7b
+python ./scripts/merge_lora_weights.py \
+    --model-path /hy-tmp/checkpoints/llava-v1.5-7b-lora \
+    --model-base /hy-tmp/checkpoints/llava-v1.5-7b-pretrain-full \
+    --save-model-path /hy-tmp/checkpoints/llava-v1.5-7b

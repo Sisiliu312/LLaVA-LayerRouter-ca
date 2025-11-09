@@ -141,4 +141,15 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=128)
     args = parser.parse_args()
 
+    checkpoint_dir = "/hy-tmp/checkpoints/llava-v1.5-7b-lora"
+
+    # # 检查 non_lora_trainables.bin
+    # if os.path.exists(os.path.join(checkpoint_dir, 'non_lora_trainables.bin')):
+    #     print("=== non_lora_trainables.bin ===")
+    #     non_lora = torch.load(os.path.join(checkpoint_dir, 'non_lora_trainables.bin'), map_location='cpu')
+    #     for key in sorted(non_lora.keys()):
+    #         if 'ca' in key or 'router' in key or 'projector' in key:
+    #             print(f"{key}: {non_lora[key].shape}")
+    #     print(f"\nTotal keys: {len(non_lora)}")
+
     eval_model(args)
