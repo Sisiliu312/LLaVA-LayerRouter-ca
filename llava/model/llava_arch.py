@@ -31,12 +31,18 @@ class LlavaMetaModel:
 
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
-        # self.ca = build_cross_attn(config)
-        # self.layer_router = build_layer_router(config)
+        
         if hasattr(config, "mm_vision_tower"):
-            print("==========================Building vision tower================")
+            # print("==========================Building vision tower================")
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
+
+            if getattr(config, 'use_ca', False):
+                self.ca = build_cross_attn(config)
+            
+            if getattr(config, 'use_router', False):
+                self.layer_router = build_layer_router(config)
+
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -64,6 +70,9 @@ class LlavaMetaModel:
 
         self.config.mm_vision_tower = vision_tower
 
+        self.config.use_ca = getattr(model_args, 'use_ca', False)
+        self.config.use_router = getattr(model_args, 'use_router', False)
+
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
 
@@ -85,15 +94,13 @@ class LlavaMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
-        if getattr(self, 'ca', None) is None:
-            self.ca = build_cross_attn(self.config)
-            for p in self.ca.parameters():
-                p.requires_grad = True
+        if self.config.use_ca:
+            if getattr(self, 'ca', None) is None:
+                self.ca = build_cross_attn(self.config)
 
-        if getattr(self, 'layer_router', None) is None:
-            self.layer_router = build_layer_router(self.config)
-            for p in self.layer_router.parameters():
-                p.requires_grad = True
+        if self.config.use_router:
+            if getattr(self, 'layer_router', None) is None:
+                self.layer_router = build_layer_router(self.config)
 
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
@@ -115,11 +122,15 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
-            if hasattr(self, 'ca'):
-                self.ca.load_state_dict(get_w(mm_projector_weights, 'ca'))
+            if self.config.use_ca and hasattr(self, 'ca') and self.ca is not None:
+                ca_weights = get_w(mm_projector_weights, 'ca')
+                if ca_weights:
+                    self.ca.load_state_dict(ca_weights)
 
-            if hasattr(self, 'layer_router'):
-                self.layer_router.load_state_dict(get_w(mm_projector_weights, 'layer_router'))
+            if self.config.use_router and hasattr(self, 'layer_router') and self.layer_router is not None:
+                router_weights = get_w(mm_projector_weights, 'layer_router')
+                if router_weights:
+                    self.layer_router.load_state_dict(router_weights)
         
         
 
@@ -200,60 +211,202 @@ class LlavaMetaForCausalLM(ABC):
     #         # print("layer_feat type:", type(layer_feat))
     #     return combined_features
 
+    # def encode_images(self, images, text_token):
+    #     """
+    #     Batched version - assumes all samples select the same top-5 layers.
+    #     More efficient but less flexible.
+    #     """
+    #     # 获取24层特征
+    #     image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
+
+    #     use_router = getattr(self.get_model().config, 'use_router', False)
+    #     use_ca = getattr(self.get_model().config, 'use_ca', False)
+
+    #     if use_router and use_ca:
+    #     # 处理text
+    #         combined_text = torch.cat(text_token, dim=0)
+    #         if combined_text.dim() == 2:
+    #             combined_text = combined_text.unsqueeze(0)
+
+    #         # print("combined_text shape:", combined_text.shape)
+
+    #         # 初始化最终输出
+    #         batch_size, text_len, dim = combined_text.shape
+    #         batch_size = image_features.shape[0]
+    #         combined_features = torch.zeros(
+    #             batch_size, text_len, dim, 
+    #             device=combined_text.device, 
+    #             dtype=combined_text.dtype
+    #         )
+            
+    #         # Use router to select top-5 layers
+    #         # For batched version, use first sample's selection for all
+    #         top_indices, top_weights, all_probs = self.get_model().layer_router(combined_text)
+            
+    #         # Use the most common selection or first sample's selection
+    #         # selected_indices = top_indices[0]
+    #         # selected_weights = top_weights[0]
+    #         print(f"Selected layers: {top_indices.tolist()}")
+    #         # print(f"Layer weights: {top_weights.tolist()}")
+            
+    #         for idx in range(len(top_indices)):
+    #         # 获取当前层特征 [batch, num_patches, dim]
+    #             # layer_feat = image_forward_outs.hidden_states[i]
+    #             # layer_feat = image_forward_outs.hidden_states[i].half()
+    #             layer_idx = top_indices[idx].item()  # 转为整数用于索引
+    #             weight = top_weights[idx]
+
+    #             layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
+    #             # print("layer_feat shape:", layer_feat.shape)
+    #             # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
+    #             # print("layer_feat type:", type(layer_feat))
+    #             layer_features = self.get_model().mm_projector(layer_feat)
+
+    #             attended = self.get_model().ca(combined_text, layer_features)
+
+    #             # print("layer_feat type:", type(layer_feat))
+    #             combined_features += weight * attended
+                
+    #             # print(f"Processed layer {idx}")
+    #             # print("combined_features shape:", combined_features.shape)
+
+    #     else:
+    #         combined_features = self.get_model().mm_projector(image_features)
+            
+    #     return combined_features
+
     def encode_images(self, images, text_token):
         """
-        Batched version - assumes all samples select the same top-5 layers.
-        More efficient but less flexible.
+        Batched version - supports flexible combinations of router and CA.
+        Handles: no router/CA, only router, only CA, or both.
         """
         # 获取24层特征
         image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
 
-        # 处理text
+        use_router = getattr(self.get_model().config, 'use_router', False)
+        use_ca = getattr(self.get_model().config, 'use_ca', False)
+
+        # Case 1: 都不使用 - 直接返回投影后的特征
+        if not use_router and not use_ca:
+            combined_features = self.get_model().mm_projector(image_features)
+            return combined_features
+
+        # 准备text token
         combined_text = torch.cat(text_token, dim=0)
         if combined_text.dim() == 2:
             combined_text = combined_text.unsqueeze(0)
+        # print("combined_text shape:",combined_text.shape)
 
-        # 初始化最终输出
-        batch_size, text_len, dim = combined_text.shape
         batch_size = image_features.shape[0]
-        combined_features = torch.zeros(
-            batch_size, text_len, dim, 
-            device=combined_text.device, 
-            dtype=combined_text.dtype
-        )
+        text_len = combined_text.shape[1]
         
-        # Use router to select top-5 layers
-        # For batched version, use first sample's selection for all
-        top_indices, top_weights, all_probs = self.get_model().layer_router(combined_text)
-        
-        # Use the most common selection or first sample's selection
-        selected_indices = top_indices[0]
-        selected_weights = top_weights[0]
-        print(f"Selected layers: {selected_indices.tolist()}")
-        print(f"Layer weights: {selected_weights.tolist()}")
-        
-        for idx in range(len(selected_indices)):
-        # 获取当前层特征 [batch, num_patches, dim]
-            # layer_feat = image_forward_outs.hidden_states[i]
-            # layer_feat = image_forward_outs.hidden_states[i].half()
-            layer_idx = selected_indices[idx].item()  # 转为整数用于索引
-            weight = selected_weights[idx]
+        # Case 2: 只使用CA，不使用Router - 对最后一层特征做CA
+        if use_ca and not use_router:
+            # 使用最后一层的特征（layer 23，即index -1）
+            last_layer_feat = image_forward_outs.hidden_states[-1][:, 1:].to(image_features.dtype)
+            last_layer_features = self.get_model().mm_projector(last_layer_feat)
+            combined_features = self.get_model().ca(combined_text, last_layer_features)
+            return combined_features
 
-            layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
-            # print("layer_feat shape:", layer_feat.shape)
-            # layer_feat = image_forward_outs.hidden_states[i].to(self.get_model().mm_projector.weight.dtype)
-            # print("layer_feat type:", type(layer_feat))
-            layer_features = self.get_model().mm_projector(layer_feat)
-
-            attended = self.get_model().ca(combined_text, layer_features)
-
-            # print("layer_feat type:", type(layer_feat))
-            combined_features += weight * attended
+        # Case 3: 只使用Router，不使用CA - 加权融合多层特征
+        if use_router and not use_ca:
+            dim = self.get_model().mm_projector(image_forward_outs.hidden_states[0][:, 1:]).shape[-1]
+            combined_features = torch.zeros(
+                batch_size, image_features.shape[1], dim,
+                device=image_features.device,
+                dtype=image_features.dtype
+            )
             
-            # print(f"Processed layer {idx}")
-            # print("combined_features shape:", combined_features.shape)
-        return combined_features
+            if self.training:
+                router_output = self.get_model().layer_router(combined_text, return_loss=True)
+                
+                if len(router_output) == 4:
+                    top_indices, top_weights, all_probs, diversity_loss = router_output
+                    
+                    if hasattr(self.get_model(), '_router_diversity_losses'):
+                        self.get_model()._router_diversity_losses.append(diversity_loss)
+                else:
+                    top_indices, top_weights, all_probs = router_output
+            else:
+                top_indices, top_weights, all_probs = self.get_model().layer_router(
+                    combined_text, return_loss=False
+                )
+            
+            # print(f"Selected layers: {top_indices.tolist()}")
+            
+            # 加权融合选中的层
+            for idx in range(len(top_indices)):
+                layer_idx = top_indices[idx].item()
+                weight = top_weights[idx]
+                
+                layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
+                layer_features = self.get_model().mm_projector(layer_feat)
+                combined_features += weight * layer_features
+            
+            # print("Combined features shape (Router only):", combined_features.shape)
+            return combined_features
 
+        # Case 4: 同时使用Router和CA - 原有逻辑
+        if use_router and use_ca:
+            dim = combined_text.shape[-1]
+            combined_features = torch.zeros(
+                batch_size, text_len, dim,
+                device=combined_text.device,
+                dtype=combined_text.dtype
+            )
+
+            # if torch.isnan(combined_features).any():
+            #     print("⚠️ combined_features initialized with NaN!")
+            
+            if self.training:
+                router_output = self.get_model().layer_router(combined_text, return_loss=True)
+                
+                if len(router_output) == 4:
+                    top_indices, top_weights, all_probs, diversity_loss = router_output
+                    
+                    if hasattr(self.get_model(), '_router_diversity_losses'):
+                        self.get_model()._router_diversity_losses.append(diversity_loss)
+                        # print(f"  ✅ Added diversity_loss: {diversity_loss.item():.6f}")
+                else:
+                    top_indices, top_weights, all_probs = router_output
+            else:
+                top_indices, top_weights, all_probs = self.get_model().layer_router(
+                    combined_text, return_loss=False
+                )
+            
+            # print(f"Selected layers: {top_indices.tolist()}")
+            
+            # Router选中的层 + CA attention
+            for idx in range(len(top_indices)):
+                layer_idx = top_indices[idx].item()
+                weight = top_weights[idx]
+
+                layer_feat = image_forward_outs.hidden_states[layer_idx][:, 1:].to(image_features.dtype)
+                # print("layer_feat shape",layer_feat.shape)
+
+                # if torch.isnan(layer_feat).any() or torch.isinf(layer_feat).any():
+                #     print(f"⚠️ Layer {layer_idx}: NaN/Inf in vision tower output")
+
+                layer_features = self.get_model().mm_projector(layer_feat)
+                # print("layer_features shape",layer_features.shape)
+
+                if torch.isnan(layer_features).any() or torch.isinf(layer_features).any():
+                    print(f"⚠️ Layer {layer_idx}: NaN/Inf in projector output")
+                    print(f"   Range: [{layer_features.min():.4f}, {layer_features.max():.4f}]")
+
+                # print(f"\n🔍 Before CA for layer {layer_idx}:")
+                # print(f"  layer_features: range=[{layer_features.min():.4f}, {layer_features.max():.4f}], has_inf={torch.isinf(layer_features).any()}")
+                attended = self.get_model().ca(combined_text, layer_features)
+
+                if torch.isnan(attended).any() or torch.isinf(attended).any():
+                    print(f"⚠️ Layer {layer_idx}: NaN/Inf in CA output")
+                    print(f"   Range: [{attended.min():.4f}, {attended.max():.4f}]")
+                
+                combined_features += weight * attended
+                # print("combined_features shape:",combined_features.shape)
+                # print(f"  combined_features: range=[{combined_features.min():.4f}, {combined_features.max():.4f}], has_inf={torch.isinf(combined_features).any()}")
+            
+            return combined_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
@@ -262,8 +415,12 @@ class LlavaMetaForCausalLM(ABC):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
-        
 
+        if self.training:
+            tune_router = getattr(self.get_model().config, 'tune_router', False)
+            if tune_router and hasattr(self.get_model(), 'layer_router'):
+                self.get_model()._router_diversity_losses = []
+        
         # ################################
         origi_input_ids = input_ids
         origi_labels = labels
@@ -310,7 +467,7 @@ class LlavaMetaForCausalLM(ABC):
         if self.training:  # 训练阶段
             input_ids = origi_input_ids
             labels = origi_labels
-            
+
             if no_attention_mask:
                 attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
             else:
@@ -487,6 +644,7 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        # print("new_input_embeds shape", new_input_embeds.shape)
 
         if _labels is None:
             new_labels = None

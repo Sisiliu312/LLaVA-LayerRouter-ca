@@ -1,36 +1,81 @@
-# Python
-__pycache__
+# # Python
+# __pycache__
+# *.pyc
+# *.egg-info
+# dist
+
+# # Log
+# *.log
+# *.log.*
+# *.json
+# *.jsonl
+
+# # Data
+# !**/alpaca-data-conversation.json
+
+# # Editor
+# .idea
+# *.swp
+
+# # Other
+# .DS_Store
+# wandb
+# output
+
+# checkpoints
+# attention_maps
+# ckpts*
+
+# .ipynb_checkpoints
+# *.ipynb
+
+# # DevContainer
+# !.devcontainer/*
+
+# # Demo
+# serve_images/
+
+# Large training outputs
+/checkpoints/
+/wandb/
+/attention_maps/
+/ckpts*/
+/output/
+/outputs/
+/logs/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Notebook junk
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
 *.pyc
-*.egg-info
-dist
+*.pyo
+*.pyd
+*.egg-info/
+dist/
 
-# Log
-*.log
-*.log.*
-*.json
-*.jsonl
+# OS files
+.DS_Store
 
-# Data
-!**/alpaca-data-conversation.json
-
-# Editor
-.idea
+# IDE
+.idea/
 *.swp
 
-# Other
-.DS_Store
-wandb
-output
+# Data
+data/
+datasets/
 
-checkpoints
-attention_maps
-ckpts*
-
-.ipynb_checkpoints
-*.ipynb
-
-# DevContainer
-!.devcontainer/*
-
-# Demo
+# Demo assets
 serve_images/
+
+# Others
+*.log
+*.log.*
+*.jsonl

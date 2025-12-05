@@ -36,9 +36,11 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
-from PIL import Image
 import torch.nn as nn
 
+from PIL import Image
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 local_rank = None
 
@@ -66,6 +68,10 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    use_ca: bool = field(default=False)
+    use_router: bool = field(default=False)
+    tune_ca: bool = field(default=False)
+    tune_router: bool = field(default=False)
 
 
 @dataclass
@@ -112,6 +118,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    diversity_weight: float = field(default=1)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -190,7 +197,13 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector', 'layer_router', 'ca']
+        keys_to_match = ['mm_projector']
+
+        if hasattr(trainer.model.config, 'use_ca') and trainer.model.config.use_ca:
+            keys_to_match.append('ca')
+        if hasattr(trainer.model.config, 'use_router') and trainer.model.config.use_router:
+            keys_to_match.append('layer_router')
+
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -795,25 +808,19 @@ def register_gradient_hooks(model):
             continue
         
         if 'layer_router' in name:
-            # Router 梯度放大 1000x
             def make_hook(pname):
                 def hook_fn(grad):
                     if grad is not None:
-                        scaled = grad * 1000.0
-                        print(f"[Router] {pname}: {grad.norm():.6e} → {scaled.norm():.3e} (1000x)")
-                        return scaled
+                        print(f"[Router] {pname}: {grad.norm():.6e}")
                     return grad
                 return hook_fn
             param.register_hook(make_hook(name))
             
         elif 'ca.' in name or 'W_q' in name or 'W_k' in name:
-            # CA 梯度放大 10x
             def make_hook(pname):
                 def hook_fn(grad):
                     if grad is not None:
-                        scaled = grad * 10.0
-                        print(f"[CA] {pname}: {grad.norm():.6e} → {scaled.norm():.4e} (10x)")
-                        return scaled
+                        print(f"[CA] {pname}: {grad.norm():.6e}")
                     return grad
                 return hook_fn
             param.register_hook(make_hook(name))
@@ -824,7 +831,6 @@ def register_gradient_hooks(model):
                 def hook_fn(grad):
                     if grad is not None:
                         print(f"[Proj] {pname}: {grad.norm():.4f} (1x)")
-                    return grad
                 return hook_fn
             param.register_hook(make_hook(name))
 
@@ -875,20 +881,20 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
             # print(model)
-            print("-=-=-=-=-=-from_pretrained-=-=-=-=-=-=-=-")
-            print(f"🔍 from_pretrained 后:")
-            print(f"  hasattr(model.model, 'ca'): {hasattr(model.model, 'ca')}")
-            print(f"  hasattr(model.model, 'layer_router'): {hasattr(model.model, 'layer_router')}")
+            # print("-=-=-=-=-=-from_pretrained-=-=-=-=-=-=-=-")
+            # print(f"🔍 from_pretrained 后:")
+            # print(f"  hasattr(model.model, 'ca'): {hasattr(model.model, 'ca')}")
+            # print(f"  hasattr(model.model, 'layer_router'): {hasattr(model.model, 'layer_router')}")
 
-            if hasattr(model.model, 'ca'):
-                print(f"  model.model.ca: {model.model.ca}")
-                if hasattr(model.model.ca, 'W_q'):
-                    print(f"  model.model.ca.W_q.weight.shape: {model.model.ca.W_q.weight.shape}")
+            # if hasattr(model.model, 'ca'):
+            #     print(f"  model.model.ca: {model.model.ca}")
+            #     if hasattr(model.model.ca, 'W_q'):
+            #         print(f"  model.model.ca.W_q.weight.shape: {model.model.ca.W_q.weight.shape}")
 
-            if hasattr(model.model, 'layer_router'):
-                print(f"  model.model.layer_router: {model.model.layer_router}")
-                if hasattr(model.model.layer_router, 'w1'):
-                    print(f"  model.model.layer_router.w1.weight.shape: {model.model.layer_router.w1.weight.shape}")
+            # if hasattr(model.model, 'layer_router'):
+            #     print(f"  model.model.layer_router: {model.model.layer_router}")
+            #     if hasattr(model.model.layer_router, 'w1'):
+            #         print(f"  model.model.layer_router.w1.weight.shape: {model.model.layer_router.w1.weight.shape}")
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -932,6 +938,10 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+        if model_args.use_router and not model_args.tune_router:
+            for name, param in model.named_parameters():
+                if 'layer_router' in name:
+                    param.requires_grad = False
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -983,19 +993,38 @@ def train(attn_implementation=None):
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+
+        model.config.use_ca = model_args.use_ca
+        model.config.use_router = model_args.use_router
+        model.config.tune_ca = model_args.tune_ca
+        model.config.tune_router = model_args.tune_router
         
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
-
-            for p in model.get_model().ca.parameters():
-                p.requires_grad = True
-
-            for name, p in model.get_model().layer_router.named_parameters():
-                p.requires_grad = True
-                print(f"  ✅ {name}: requires_grad=True")
             
+            if model_args.use_ca:
+                ca_module = model.get_model().get_cross_attn()
+                if ca_module is not None:
+                    if model_args.tune_ca:
+                        for p in ca_module.parameters():
+                            p.requires_grad = True
+                    else:
+                        for p in ca_module.parameters():
+                            p.requires_grad = False
+
+            if model_args.use_router:
+                router_module = model.get_model().get_layer_router()
+                model.config.diversity_weight = training_args.diversity_weight
+                if router_module is not None:
+                    if model_args.tune_router:
+                        for p in router_module.parameters():
+                            p.requires_grad = True
+                    else:
+                        for p in router_module.parameters():
+                            p.requires_grad = False
+    
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
@@ -1030,29 +1059,30 @@ def train(attn_implementation=None):
     # for name, param in model.named_parameters():
     #     print(f"{name} 的梯度：", param.grad)
     #     print(f"{name} 的需要修改：", param.requires_grad)
-    print("=" * 60)
-    print("🔍 训练配置:")
-    print(f"  lora_enable: {training_args.lora_enable}")
-    print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
-    print("=" * 60)
+    # print("=" * 60)
+    # print("🔍 训练配置:")
+    # print(f"  lora_enable: {training_args.lora_enable}")
+    # print(f"  tune_mm_mlp_adapter: {model_args.tune_mm_mlp_adapter}")
+    # print("=" * 60)
 
-    # 检查模型结构
-    print("\n🔍 layer_router 结构:")
-    for name, module in model.get_model().layer_router.named_modules():
-        if name:
-            print(f"  {name}: {type(module).__name__}")
+    # # 检查模型结构
+    # print("\n🔍 layer_router 结构:")
+    # for name, module in model.get_model().layer_router.named_modules():
+    #     if name:
+    #         print(f"  {name}: {type(module).__name__}")
 
-    print("\n🔍 ca 结构:")
-    for name, module in model.get_model().ca.named_modules():
-        if name:
-            print(f"  {name}: {type(module).__name__}")
+    # print("\n🔍 ca 结构:")
+    # for name, module in model.get_model().ca.named_modules():
+    #     if name:
+    #         print(f"  {name}: {type(module).__name__}")
 
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
 
-    register_gradient_hooks(model)
+    # register_gradient_hooks(model)
+
     
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

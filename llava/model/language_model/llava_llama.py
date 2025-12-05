@@ -1,19 +1,10 @@
 #    Copyright 2023 Haotian Liu
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
+#    ...
 
 from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass  # ✅ 新增
 
 import torch
 import torch.nn as nn
@@ -27,6 +18,15 @@ from transformers.generation.utils import GenerateOutput
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 
+# ✅ 新增自定义输出类
+@dataclass
+class LlavaCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """
+    扩展的输出类，添加 router_diversity_loss
+    """
+    router_diversity_loss: Optional[torch.FloatTensor] = None
+
+
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
 
@@ -35,10 +35,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
-        # print(self.__mro__)
         super(LlavaLlamaModel, self).__init__(config)
-        # LlavaMetaModel.__init__(self, config)
-        # LlamaModel.__init__(self, config)
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
@@ -56,6 +53,31 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
+    
+    def _compute_router_diversity_loss(self):
+        """
+        计算 router diversity loss
+        从 llava_arch.encode_images 中收集的 diversity losses
+        """
+        if not self.training:
+            return None
+            
+        # 检查是否启用了 router
+        use_router = getattr(self.model.config, 'use_router', False)
+        if not use_router:
+            return None
+        
+        # 从 model 中获取收集的 diversity losses
+        if hasattr(self.model, '_router_diversity_losses'):
+            losses = self.model._router_diversity_losses
+            if losses:
+                avg_loss = torch.stack(losses).mean()
+                # print(f"  🔧 Computed diversity loss: {avg_loss.item():.6f} from {len(losses)} samples")
+                # 清空列表，为下一个 batch 准备
+                self.model._router_diversity_losses = []
+                return avg_loss
+        
+        return None
 
     def forward(
         self,
@@ -71,7 +93,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        **kwargs
+    ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
+
+        # print(f"\n{'='*60}")
+        # print(f"🔍 llava_llama.forward 开始:")
+        # print(f"  self.training: {self.training}")
+        # print(f"{'='*60}\n")
 
         if inputs_embeds is None:
             (
@@ -91,7 +119,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 image_sizes
             )
 
-        return super().forward(
+        # ✅ 调用父类的 forward
+        outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -101,8 +130,51 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            return_dict=return_dict,
+            **kwargs
         )
+
+        task_loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
+
+        # 3️⃣ 计算 router diversity loss
+        router_diversity_loss = None
+        total_loss = task_loss
+
+        if self.training and task_loss is not None and labels is not None:
+            router_diversity_loss = self._compute_router_diversity_loss()
+            
+            if router_diversity_loss is not None:
+                # ✅ 从config中读取diversity_weight
+                diversity_weight = getattr(self.config, 'diversity_weight', 1.0)
+                
+                # ✅ 计算加权的diversity loss
+                weighted_diversity_loss = diversity_weight * router_diversity_loss
+                
+                # ✅ 累加到总损失
+                total_loss = task_loss + weighted_diversity_loss
+                
+                # print(f"\n{'='*60}")
+                # print(f"  Task Loss:            {task_loss.item():.6f}")
+                # print(f"  Diversity Loss (raw): {router_diversity_loss.item():.6f}")
+                # print(f"  Diversity Weight:     {diversity_weight:.2f}")
+                # print(f"  Diversity Loss (weighted): {weighted_diversity_loss.item():.6f}")
+                # print(f"  Total Loss:           {total_loss.item():.6f}")
+                # print(f"{'='*60}\n")
+                
+        # 5️⃣ 返回结果（带上 diversity loss）
+        if isinstance(outputs, dict):
+            outputs['loss'] = total_loss
+            outputs['router_diversity_loss'] = router_diversity_loss
+            return outputs
+        else:
+            return LlavaCausalLMOutputWithPast(
+                loss=total_loss,
+                logits=outputs.logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                router_diversity_loss=router_diversity_loss,
+            )
 
     @torch.no_grad()
     def generate(
